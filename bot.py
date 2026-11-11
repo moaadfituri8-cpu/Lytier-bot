@@ -1,409 +1,746 @@
-from __future__ import annotations
-import os, asyncio, sqlite3, contextlib, aiohttp, discord
-from discord import app_commands
+
+import os
+import re
+import logging
+from io import BytesIO
+from urllib.parse import quote
+
+import aiohttp
+import asyncpg
+import discord
+
+from PIL import Image, ImageSequence
 from discord.ext import commands
-from pathlib import Path
+from discord import app_commands
+from discord.ui import View, Select, Modal, TextInput, Button
 
-# ── env vars (ضعهم في Railway Variables) ──────────────────────────────────────
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "changeme")
-API_BASE      = os.getenv("API_BASE", "http://localhost:8000")
-GUILD_ID      = int(os.environ["GUILD_ID"])
-TESTER_ROLE   = os.getenv("TESTER_ROLE", "Tester")
-TICKET_CAT    = os.getenv("TICKET_CATEGORY", "Tickets")
-DB_PATH       = Path(os.getenv("DB_PATH", "lytier_bot.db"))
 
-# ── constants ─────────────────────────────────────────────────────────────────
-MODS  = ['VANILLA','SWORD','UHC','SPEAR & MACE','MACE','AXE','POT','SMP']
-TIERS = ['HT1','HT2','HT3','HT4','HT5','LT1','LT2','LT3','LT4','LT5']
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-TIER_COLORS = {
-    'HT1':0xD4AF37,'HT2':0xC0C0C0,'HT3':0xCD7F32,
-    'HT4':0x7B9EBF,'HT5':0x5A7A9A,'LT1':0x4A6A8A,
-    'LT2':0x3A5070,'LT3':0x2A3850,'LT4':0x1A2638,'LT5':0x2A2A35,
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+TESTER_ROLE_ID = int(os.getenv("TESTER_ROLE_ID", "0"))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
+
+SKIN_RENDER_BASE = os.getenv(
+    "SKIN_RENDER_BASE",
+    "https://skinrender.dev"
+).rstrip("/")
+
+DATABASE_SSL = os.getenv("DATABASE_SSL", "require").lower()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+# ==========================================
+# MODES
+# ==========================================
+
+MODS = {
+    "VANILLA": "<:emoji_1:1569697593628565635>",
+    "SWORD": "<:emoji_6:1569698369792774176>",
+    "UHC": "<:emoji_2:1569697618307846225>",
+    "SPEAR MACE": "<:emoji_6:1569698644523884685>",
+    "MACE": "<:emoji_3:1569697636607336538>",
+    "AXE": "<:emoji_7:1569698919515168778>",
+    "POT": "<:emoji_9:1569699936134627448>",
+    "SMP": "<:emoji_8:1569699066030325861>",
 }
 
-STEVE_UUID = "8667ba71b85a4004af54457a9734eed7"
 
-MOD_OPTIONS = [
-    discord.SelectOption(label="VANILLA",    emoji="<:emoji_1:1569697593628565635>", value="VANILLA"),
-    discord.SelectOption(label="SWORD",      emoji="<:emoji_5:1569697687350284288>", value="SWORD"),
-    discord.SelectOption(label="MACE",       emoji="<:emoji_3:1569697636607336538>", value="MACE"),
-    discord.SelectOption(label="SPEAR MACE", emoji="<:emoji_6:1569698644523884685>", value="SPEAR MACE"),
-    discord.SelectOption(label="AXE",        emoji="<:emoji_7:1569698919515168778>", value="AXE"),
-    discord.SelectOption(label="SMP",        emoji="<:emoji_8:1569699066030325861>", value="SMP"),
-    discord.SelectOption(label="POT",        emoji="<:emoji_9:1569699936134627448>", value="POT"),
-    discord.SelectOption(label="UHC",        emoji="<:emoji_2:1569697618307846225>", value="UHC"),
+TIERS = [
+    "HT1", "HT2", "HT3", "HT4", "HT5",
+    "LT1", "LT2", "LT3", "LT4", "LT5"
 ]
 
-# ── database ──────────────────────────────────────────────────────────────────
-DDL = """
-CREATE TABLE IF NOT EXISTS role_map (
-    guild_id  INTEGER NOT NULL,
-    tier      TEXT    NOT NULL,
-    role_id   INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, tier)
-);
 
-CREATE TABLE IF NOT EXISTS players (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    username  TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    discord   TEXT,
-    premium   INTEGER NOT NULL DEFAULT 0
-);
+TIER_COLORS = {
+    "HT1": 0xFF3030,
+    "HT2": 0xFF5555,
+    "HT3": 0xFF7777,
+    "HT4": 0xE67E22,
+    "HT5": 0xF1C40F,
+    "LT1": 0x3498DB,
+    "LT2": 0x2980B9,
+    "LT3": 0x1ABC9C,
+    "LT4": 0x2ECC71,
+    "LT5": 0x95A5A6,
+}
 
-CREATE TABLE IF NOT EXISTS tiers (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id  INTEGER NOT NULL REFERENCES players(id),
-    mod        TEXT    NOT NULL,
-    tier       TEXT    NOT NULL,
-    tester     TEXT,
-    tested_at  TEXT    DEFAULT (datetime('now')),
-    UNIQUE(player_id, mod)
-);
-"""
 
-@contextlib.contextmanager
-def get_db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+# ==========================================
+# BOT
+# ==========================================
 
-def init_db():
-    with get_db() as db:
-        db.executescript(DDL)
-
-def db_get_role_map(guild_id: int) -> dict[str, int]:
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT tier, role_id FROM role_map WHERE guild_id = ?", (guild_id,)
-        ).fetchall()
-    return {r["tier"]: r["role_id"] for r in rows}
-
-def db_set_role(guild_id: int, tier: str, role_id: int):
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO role_map (guild_id, tier, role_id) VALUES (?,?,?) "
-            "ON CONFLICT(guild_id, tier) DO UPDATE SET role_id = excluded.role_id",
-            (guild_id, tier, role_id)
-        )
-
-def db_upsert_player(username: str, discord_tag: str, premium: bool,
-                     mod: str, tier: str, tester: str):
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO players (username, discord, premium) VALUES (?,?,?) "
-            "ON CONFLICT(username) DO UPDATE SET discord=excluded.discord, premium=excluded.premium",
-            (username, discord_tag, int(premium))
-        )
-        pid = db.execute(
-            "SELECT id FROM players WHERE username = ?", (username,)
-        ).fetchone()["id"]
-        db.execute(
-            "INSERT INTO tiers (player_id, mod, tier, tester) VALUES (?,?,?,?) "
-            "ON CONFLICT(player_id, mod) DO UPDATE SET "
-            "tier=excluded.tier, tester=excluded.tester, tested_at=datetime('now')",
-            (pid, mod, tier, tester)
-        )
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-def skin_url(username: str, premium: bool, size: int = 128) -> str:
-    uuid = username if premium else STEVE_UUID
-    return f"https://crafatar.com/avatars/{uuid}?size={size}&overlay"
-
-# ── bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
 
-bot  = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-G    = discord.Object(id=GUILD_ID)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /welcome
-# ══════════════════════════════════════════════════════════════════════════════
-@tree.command(name="welcome", description="Show the welcome message", guild=G)
-async def welcome(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🏆 Welcome to LyTier Test",
-        description=(
-            "**Welcome to the best ranking server in Libya**\n\n"
-            "Here we test you to determine if you are among the best "
-            "Libyan Minecraft players."
-        ),
-        color=0xC8151B,
-    )
-    embed.add_field(
-        name="📋 Available Mods",
-        value="\n".join(f"{o.emoji} **{o.label}**" for o in MOD_OPTIONS),
-        inline=False,
-    )
-    embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-    await interaction.response.send_message(embed=embed)
+class LytierBot(commands.Bot):
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /tier  — Tester role فقط
-# ══════════════════════════════════════════════════════════════════════════════
-@tree.command(name="tier", description="Submit a tier test result", guild=G)
-@app_commands.describe(
-    nameplayer="Minecraft username",
-    user="Discord user tested",
-    mod="Mod tested",
-    tier="Tier assigned (HT1–LT5)",
-    premium="Premium account?",
-)
-@app_commands.choices(
-    mod =[app_commands.Choice(name=m, value=m) for m in MODS],
-    tier=[app_commands.Choice(name=t, value=t) for t in TIERS],
-)
-async def tier_cmd(
-    interaction: discord.Interaction,
-    nameplayer:  str,
-    user:        discord.Member,
-    mod:         app_commands.Choice[str],
-    tier:        app_commands.Choice[str],
-    premium:     bool = False,
-):
-    # ── Tester role check ──
-    tester_role = discord.utils.get(interaction.guild.roles, name=TESTER_ROLE)
-    if tester_role and tester_role not in interaction.user.roles:
-        await interaction.response.send_message(
-            f"❌ You need the **{TESTER_ROLE}** role to submit tier results.",
-            ephemeral=True
-        )
-        return
+    async def setup_hook(self):
 
-    await interaction.response.defer()
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is missing!")
 
-    # ── push to API (optional — also writes locally below) ──
-    if API_BASE != "http://localhost:8000":
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{API_BASE}/api/tier",
-                json={
-                    "username": nameplayer, "discord": str(user),
-                    "mod": mod.value, "tier": tier.value,
-                    "tester": str(interaction.user), "premium": premium,
-                },
-                params={"token": BOT_TOKEN}
-            ) as resp:
-                if resp.status not in (200, 201):
-                    body = await resp.text()
-                    await interaction.followup.send(f"❌ API error: {body}", ephemeral=True)
-                    return
+        ssl_value = "require" if DATABASE_SSL == "require" else None
 
-    # ── write directly to local DB ──
-    db_upsert_player(nameplayer, str(user), premium, mod.value, tier.value, str(interaction.user))
-
-    # ── build embed ──
-    color = TIER_COLORS.get(tier.value, 0x4A6A8A)
-    embed = discord.Embed(color=color)
-    embed.set_author(
-        name="LyTier Test — Tier Result",
-        icon_url=skin_url(STEVE_UUID, False, 32)
-    )
-    embed.add_field(name="Name",       value=f"**{nameplayer}**",  inline=True)
-    embed.add_field(name="Discord",    value=user.mention,          inline=True)
-    embed.add_field(name="\u200b",     value="\u200b",              inline=True)
-    embed.add_field(name="Mod",        value=f"`{mod.value}`",      inline=True)
-    embed.add_field(name="Tier",       value=f"**{tier.value}**",   inline=True)
-    embed.add_field(name="Account",    value="Premium" if premium else "Cracked", inline=True)
-    embed.add_field(name="Tester by",  value=interaction.user.mention, inline=False)
-    embed.set_thumbnail(url=skin_url(nameplayer, premium))
-    embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-
-    # ── auto-role: شيل القديم، أعطِ الجديد ──
-    gmap = db_get_role_map(interaction.guild_id)
-    if gmap:
-        all_tier_role_ids = set(gmap.values())
-        to_remove = [r for r in user.roles if r.id in all_tier_role_ids]
-        if to_remove:
-            await user.remove_roles(*to_remove, reason="LyTier tier update")
-        new_rid = gmap.get(tier.value)
-        if new_rid:
-            new_role = interaction.guild.get_role(new_rid)
-            if new_role:
-                await user.add_roles(new_role, reason=f"LyTier {tier.value}")
-                embed.add_field(name="Role assigned", value=new_role.mention, inline=False)
-
-    await interaction.followup.send(embed=embed)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /auto_role  — admins فقط، محفوظ في DB
-# ══════════════════════════════════════════════════════════════════════════════
-@tree.command(name="auto_role", description="Map a tier to a Discord role (admin only)", guild=G)
-@app_commands.describe(
-    tier="Tier to map",
-    role="Role to assign for this tier",
-)
-@app_commands.choices(
-    tier=[app_commands.Choice(name=t, value=t) for t in TIERS],
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def auto_role_cmd(
-    interaction: discord.Interaction,
-    tier: app_commands.Choice[str],
-    role: discord.Role,
-):
-    db_set_role(interaction.guild_id, tier.value, role.id)
-
-    gmap  = db_get_role_map(interaction.guild_id)
-    lines = "\n".join(
-        f"`{t}` → <@&{gmap[t]}>" for t in TIERS if t in gmap
-    ) or "None set yet."
-
-    embed = discord.Embed(
-        title="✅ Auto-Role Saved",
-        description=f"`{tier.value}` → {role.mention}\n\n**Full mapping:**\n{lines}",
-        color=TIER_COLORS.get(tier.value, 0xC8151B),
-    )
-    embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@auto_role_cmd.error
-async def auto_role_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Admins only.", ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /lookup
-# ══════════════════════════════════════════════════════════════════════════════
-@tree.command(name="lookup", description="Look up a player's tier profile", guild=G)
-@app_commands.describe(player="Minecraft username")
-async def lookup(interaction: discord.Interaction, player: str):
-    await interaction.response.defer()
-    with get_db() as db:
-        p = db.execute(
-            "SELECT id, username, discord, premium FROM players WHERE username = ?",
-            (player,)
-        ).fetchone()
-        if not p:
-            await interaction.followup.send(f"❌ `{player}` not found.", ephemeral=True)
-            return
-        rows = db.execute(
-            "SELECT mod, tier FROM tiers WHERE player_id = ?", (p["id"],)
-        ).fetchall()
-
-    embed = discord.Embed(title=p["username"], color=0xC8151B)
-    embed.set_thumbnail(url=skin_url(p["username"], bool(p["premium"])))
-    embed.add_field(name="Discord", value=p["discord"] or "—", inline=True)
-    embed.add_field(name="Account", value="Premium" if p["premium"] else "Cracked", inline=True)
-    if rows:
-        embed.add_field(
-            name="Tiers",
-            value="\n".join(f"`{r['mod']}` → **{r['tier']}**" for r in rows),
-            inline=False,
-        )
-    else:
-        embed.add_field(name="Tiers", value="No tiers yet", inline=False)
-    embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-    await interaction.followup.send(embed=embed)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /ticket
-# ══════════════════════════════════════════════════════════════════════════════
-class ModSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            placeholder="Choose a mod…",
-            min_values=1, max_values=1,
-            options=MOD_OPTIONS,
+        self.db = await asyncpg.create_pool(
+            DATABASE_URL,
+            ssl=ssl_value,
+            min_size=1,
+            max_size=5
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        mod   = self.values[0]
-        guild = interaction.guild
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS player_tiers (
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                player_name TEXT NOT NULL,
+                mod TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                tester_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(guild_id, player_name, mod)
+            );
+        """)
 
-        category = discord.utils.get(guild.categories, name=TICKET_CAT)
-        if not category:
-            category = await guild.create_category(TICKET_CAT)
+        self.add_view(TicketPanel())
+        self.add_view(TicketControls())
 
-        ticket_num   = len(category.channels) + 1
-        channel_name = f"ticket-{ticket_num}"
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
 
-        tester_role = discord.utils.get(guild.roles, name=TESTER_ROLE)
-        overwrites  = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user:   discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        }
-        if tester_role:
-            overwrites[tester_role] = discord.PermissionOverwrite(
-                read_messages=True, send_messages=True
+        logging.info("Lytier bot is ready!")
+
+
+bot = LytierBot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# ==========================================
+# PERMISSIONS
+# ==========================================
+
+def is_tester(member):
+
+    if member.guild_permissions.administrator:
+        return True
+
+    if TESTER_ROLE_ID == 0:
+        return False
+
+    return any(
+        role.id == TESTER_ROLE_ID
+        for role in member.roles
+    )
+
+
+# ==========================================
+# SKIN RENDER
+# ==========================================
+
+async def get_skin_gif(player_name):
+
+    encoded_name = quote(player_name)
+
+    url = (
+        f"{SKIN_RENDER_BASE}/render/"
+        f"{encoded_name}/bust.apng"
+        "?size=256&pose=walk&yaw=35&pitch=12&fit=false"
+    )
+
+    timeout = aiohttp.ClientTimeout(total=25)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+            async with session.get(url) as response:
+
+                if response.status != 200:
+                    logging.warning(
+                        "Skin API returned status %s",
+                        response.status
+                    )
+                    return None
+
+                apng_data = await response.read()
+
+        original = Image.open(BytesIO(apng_data))
+
+        frames = []
+        durations = []
+
+        for frame in ImageSequence.Iterator(original):
+
+            frames.append(frame.convert("RGBA").copy())
+
+            durations.append(
+                frame.info.get("duration", 100)
             )
 
-        channel = await guild.create_text_channel(
-            channel_name, category=category, overwrites=overwrites,
-            topic=f"Ticket #{ticket_num} | Mod: {mod} | {interaction.user}",
+        if not frames:
+            return None
+
+        output = BytesIO()
+
+        frames[0].save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=0,
+            disposal=2,
+            optimize=True
         )
 
-        embed = discord.Embed(
-            title=f"Ticket #{ticket_num} — {mod}",
-            description=(
-                f"{interaction.user.mention} opened a ticket for **{mod}**.\n\n"
-                "A tester will be with you shortly.\n"
-                "Use `/close` to close this channel when done."
-            ),
-            color=0xC8151B,
+        output.seek(0)
+
+        return output.getvalue()
+
+    except Exception:
+        logging.exception("Skin rendering failed.")
+        return None
+
+
+# ==========================================
+# DATABASE
+# ==========================================
+
+async def save_tier(
+    guild_id,
+    player_name,
+    mod,
+    tier,
+    tester_id
+):
+
+    await bot.db.execute("""
+        INSERT INTO player_tiers (
+            guild_id,
+            player_name,
+            mod,
+            tier,
+            tester_id
         )
-        embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-        await channel.send(embed=embed)
-        await interaction.response.send_message(
-            f"✅ Ticket created: {channel.mention}", ephemeral=True
+        VALUES ($1, $2, $3, $4, $5)
+
+        ON CONFLICT (guild_id, player_name, mod)
+        DO UPDATE SET
+            tier = EXCLUDED.tier,
+            tester_id = EXCLUDED.tester_id,
+            created_at = NOW();
+    """,
+        guild_id,
+        player_name,
+        mod,
+        tier,
+        tester_id
+    )
+
+
+# ==========================================
+# TIER EMBED
+# ==========================================
+
+def make_tier_embed(
+    player_name,
+    mod,
+    tier,
+    tester,
+    animated_skin
+):
+
+    tier = tier.upper()
+    mod = mod.upper()
+
+    if tier.startswith("LT"):
+        tier_label = "Low tier:"
+    else:
+        tier_label = "High tier:"
+
+    embed = discord.Embed(
+        title="『 𝐋𝐲𝐭𝐢𝐞𝐫 🇱🇾 』",
+        color=TIER_COLORS.get(tier, 0x5865F2)
+    )
+
+    embed.add_field(
+        name="Name:",
+        value=f"**{player_name}**",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Mod:",
+        value=f"**{mod} {MODS[mod]}**",
+        inline=False
+    )
+
+    embed.add_field(
+        name=tier_label,
+        value=f"**{tier}**",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Test by:",
+        value=tester.mention,
+        inline=False
+    )
+
+    embed.set_footer(
+        text="Lytier Test 🇱🇾 • Official Tier Results"
+    )
+
+    if animated_skin:
+        embed.set_thumbnail(url="attachment://skin.gif")
+
+    else:
+        # Static fallback if the animation API is unavailable
+        embed.set_thumbnail(
+            url=(
+                f"{SKIN_RENDER_BASE}/render/"
+                f"{quote(player_name)}/bust?size=200"
+                "&yaw=35&pitch=12"
+            )
+        )
+
+    return embed
+
+
+# ==========================================
+# TIER COMMAND
+# ==========================================
+
+@app_commands.guild_only()
+@app_commands.choices(
+    mod=[
+        app_commands.Choice(name=name, value=name)
+        for name in MODS
+    ],
+    tier=[
+        app_commands.Choice(name=name, value=name)
+        for name in TIERS
+    ]
+)
+@bot.tree.command(
+    name="tier",
+    description="Publish a Minecraft player's tier."
+)
+async def tier_command(
+    interaction: discord.Interaction,
+    name: str,
+    mod: app_commands.Choice[str],
+    tier: app_commands.Choice[str]
+):
+
+    if not is_tester(interaction.user):
+        return await interaction.response.send_message(
+            "❌ ليس لديك صلاحية التستر.",
+            ephemeral=True
+        )
+
+    player_name = name.strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", player_name):
+        return await interaction.response.send_message(
+            "❌ اسم ماينكرافت غير صالح.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer()
+
+    skin_gif = await get_skin_gif(player_name)
+
+    embed = make_tier_embed(
+        player_name,
+        mod.value,
+        tier.value,
+        interaction.user,
+        skin_gif is not None
+    )
+
+    await save_tier(
+        interaction.guild_id,
+        player_name,
+        mod.value,
+        tier.value,
+        interaction.user.id
+    )
+
+    if skin_gif:
+
+        file = discord.File(
+            BytesIO(skin_gif),
+            filename="skin.gif"
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            file=file
+        )
+
+    else:
+
+        await interaction.followup.send(
+            embed=embed
         )
 
 
-class TicketView(discord.ui.View):
+# ==========================================
+# TICKET PANEL
+# ==========================================
+
+class TicketPanel(View):
+
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(ModSelect())
+        self.add_item(TicketModSelect())
 
 
-@tree.command(name="ticket", description="Open a tier-test ticket", guild=G)
-async def ticket_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📋 Open a Tier Test Ticket",
-        description=(
-            "**Welcome to the best ranking server in Libya**\n\n"
-            "Here we test you to determine if you are among the best "
-            "Libyan Minecraft players.\n\n"
-            "Select the mod you want to be tested in:"
-        ),
-        color=0xC8151B,
+class TicketModSelect(Select):
+
+    def __init__(self):
+
+        options = []
+
+        for name, emoji in MODS.items():
+
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    value=name,
+                    emoji=discord.PartialEmoji.from_str(emoji),
+                    description=f"Request a {name} test"
+                )
+            )
+
+        super().__init__(
+            placeholder="Choose your testing mode...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="lytier:ticket_mod"
+        )
+
+    async def callback(self, interaction):
+
+        selected_mod = self.values[0]
+
+        await interaction.response.send_modal(
+            TicketAccountModal(selected_mod)
+        )
+
+
+# ==========================================
+# PREMIUM / CRACKED MODAL
+# ==========================================
+
+class TicketAccountModal(Modal):
+
+    def __init__(self, mod):
+
+        super().__init__(
+            title="Lytier Test • Account Type"
+        )
+
+        self.mod = mod
+
+        self.account_type = TextInput(
+            label="Premium or Cracked?",
+            placeholder="Write Premium or Cracked",
+            min_length=6,
+            max_length=7,
+            required=True
+        )
+
+        self.add_item(self.account_type)
+
+    async def on_submit(self, interaction):
+
+        account = self.account_type.value.strip().lower()
+
+        if account not in ("premium", "cracked"):
+
+            return await interaction.response.send_message(
+                "❌ اكتب Premium أو Cracked فقط.",
+                ephemeral=True
+            )
+
+        guild = interaction.guild
+
+        if guild is None:
+            return
+
+        # Check existing ticket
+        for channel in guild.text_channels:
+
+            if channel.topic == f"lytier_ticket:{interaction.user.id}":
+
+                return await interaction.response.send_message(
+                    f"لديك تكت مفتوح بالفعل: {channel.mention}",
+                    ephemeral=True
+                )
+
+        category = guild.get_channel(TICKET_CATEGORY_ID)
+
+        if not isinstance(category, discord.CategoryChannel):
+            category = None
+
+        bot_member = guild.me
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False
+            ),
+
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True
+            )
+        }
+
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                read_message_history=True
+            )
+
+        if TESTER_ROLE_ID:
+
+            tester_role = guild.get_role(TESTER_ROLE_ID)
+
+            if tester_role:
+
+                overwrites[tester_role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+
+        safe_name = re.sub(
+            r"[^a-z0-9-]",
+            "-",
+            interaction.user.name.lower()
+        )[:20]
+
+        try:
+
+            channel = await guild.create_text_channel(
+                name=f"test-{safe_name}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"lytier_ticket:{interaction.user.id}"
+            )
+
+            embed = discord.Embed(
+                title="『 𝐋𝐲𝐭𝐢𝐞𝐫 𝐓𝐞𝐬𝐭 🇱🇾 』",
+                description=(
+                    f"Welcome to **Lytier Test**, {interaction.user.mention}!\n\n"
+
+                    "نورت في **Lytier Test 🇱🇾**!\n"
+                    "يسعدنا اختيارك لسيرفرنا، ونتمنى لك اختباراً ممتعاً.\n\n"
+
+                    "**Ticket Information**\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"**Player:** {interaction.user.mention}\n"
+                    f"**Game Mode:** {self.mod} {MODS[self.mod]}\n"
+                    f"**Account Type:** {account.capitalize()}\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+                    "**Before Your Test**\n"
+                    "• تأكد من أنك اخترت المود الصحيح.\n"
+                    "• انتظر حتى يتوفر أحد المختبرين.\n"
+                    "• لا تقم بمنشن الإدارة بشكل متكرر.\n"
+                    "• حافظ على الاحترام داخل التكت.\n\n"
+
+                    "**Important**\n"
+                    "سيتم اختبارك من قبل أحد أعضاء فريق الإدارة، "
+                    "وبعد انتهاء الاختبار سيتم إرسال نتيجتك هنا.\n\n"
+
+                    "يرجى الانتظار حتى تختبرك الإدارة.\n\n"
+
+                    "**Thank you for choosing Lytier Test 🇱🇾**"
+                ),
+                color=0x5865F2
+            )
+
+            embed.set_footer(
+                text="Lytier Test • Please wait for staff"
+            )
+
+            await channel.send(
+                content=interaction.user.mention,
+                embed=embed,
+                view=TicketControls()
+            )
+
+            await interaction.response.send_message(
+                f"✅ تم فتح تكتك بنجاح: {channel.mention}",
+                ephemeral=True
+            )
+
+        except discord.Forbidden:
+
+            await interaction.response.send_message(
+                "❌ البوت لا يملك صلاحية إنشاء الرومات.",
+                ephemeral=True
+            )
+
+        except Exception:
+
+            logging.exception("Ticket creation failed.")
+
+            await interaction.response.send_message(
+                "❌ حدث خطأ أثناء إنشاء التكت.",
+                ephemeral=True
+            )
+
+
+# ==========================================
+# TICKET CLOSE BUTTON
+# ==========================================
+
+class TicketControls(View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Close Ticket",
+        emoji="🔒",
+        style=discord.ButtonStyle.danger,
+        custom_id="lytier:close_ticket"
     )
-    embed.set_footer(text="LyTier Test • Libya's #1 Minecraft PvP Ranking")
-    await interaction.response.send_message(embed=embed, view=TicketView())
+    async def close_ticket(
+        self,
+        interaction,
+        button
+    ):
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /close
-# ══════════════════════════════════════════════════════════════════════════════
-@tree.command(name="close", description="Close this ticket channel", guild=G)
-async def close_cmd(interaction: discord.Interaction):
-    ch = interaction.channel
-    if not (ch.name.startswith("ticket-") and ch.category and ch.category.name == TICKET_CAT):
-        await interaction.response.send_message("❌ Not a ticket channel.", ephemeral=True)
-        return
-    await interaction.response.send_message("🔒 Closing ticket…")
-    await asyncio.sleep(3)
-    await ch.delete(reason=f"Closed by {interaction.user}")
+        channel = interaction.channel
 
-# ══════════════════════════════════════════════════════════════════════════════
-# startup
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.event
-async def on_ready():
-    init_db()
-    bot.add_view(TicketView())
-    await tree.sync(guild=G)
-    print(f"[LyTier Bot] {bot.user} | Guild: {GUILD_ID} | DB: {DB_PATH}")
+        if not isinstance(channel, discord.TextChannel):
+            return
 
-bot.run(DISCORD_TOKEN)
+        topic = channel.topic or ""
+
+        match = re.fullmatch(
+            r"lytier_ticket:(\d+)",
+            topic
+        )
+
+        if not match:
+
+            return await interaction.response.send_message(
+                "❌ هذه ليست قناة تكت.",
+                ephemeral=True
+            )
+
+        owner_id = int(match.group(1))
+
+        is_owner = interaction.user.id == owner_id
+        staff = is_tester(interaction.user)
+
+        if not is_owner and not staff:
+
+            return await interaction.response.send_message(
+                "❌ لا يمكنك إغلاق هذا التكت.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "🔒 سيتم إغلاق التكت."
+        )
+
+        await channel.delete(
+            reason=f"Ticket closed by {interaction.user}"
+        )
+
+
+# ==========================================
+# TICKET PANEL COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="ticket_panel",
+    description="Send the Lytier ticket panel."
+)
+@app_commands.guild_only()
+async def ticket_panel_command(interaction):
+
+    if not is_tester(interaction.user):
+
+        return await interaction.response.send_message(
+            "❌ ليس لديك صلاحية.",
+            ephemeral=True
+        )
+
+    embed = discord.Embed(
+        title="『 𝐋𝐲𝐭𝐢𝐞𝐫 🇱🇾 』",
+        description=(
+            "Welcome to **Lytier Test 🇱🇾**!\n\n"
+
+            "هل ترغب في معرفة مستواك والحصول على تقييم "
+            "رسمي لمهاراتك في Minecraft؟ أنت في المكان الصحيح!\n\n"
+
+            "من خلال نظام الاختبارات الخاص بنا، يمكنك طلب اختبار "
+            "في المود الذي تفضله والحصول على تقييم من أحد المختبرين.\n\n"
+
+            "**How to Start?**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "1. اختر المود الذي تريد اختباره من القائمة.\n"
+            "2. ستظهر لك نافذة لتحديد نوع حسابك.\n"
+            "3. اختر Premium أو Cracked.\n"
+            "4. سيتم إنشاء تكت خاص بك مع فريق الإدارة.\n"
+            "5. انتظر المختبر حتى يبدأ اختبارك.\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            "**Testing Rules**\n"
+            "• اختر المود المناسب لك.\n"
+            "• لا تفتح أكثر من تكت لنفس الطلب.\n"
+            "• لا تزعج المختبرين بالمنشن المتكرر.\n"
+            "• تعامل باحترام مع الجميع.\n\n"
+
+            "نتمنى لك تجربة رائعة ونتيجة موفقة!\n\n"
+            "**Lytier Test 🇱🇾**"
+        ),
+        color=0x5865F2
+    )
+
+    embed.set_footer(
+        text="Select a game mode below to open your ticket."
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=TicketPanel()
+    )
+
+
+# ==========================================
+# START
+# ==========================================
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing!")
+
+bot.run(TOKEN)
+

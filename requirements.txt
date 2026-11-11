@@ -3,4 +3,3 @@ audioop-lts>=0.2.1
 aiohttp>=3.10.0
 asyncpg>=0.30.0
 Pillow>=11.0.0
-
